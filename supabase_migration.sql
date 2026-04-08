@@ -1,7 +1,7 @@
 -- ============================================================
 -- API Key Pool Migration
--- Adds reset_period ('daily' | 'monthly') to api_keys and
--- updates all functions to support both period types.
+-- Adds reset_period ('daily' | 'monthly'), rate_limit_per_minute
+-- to api_keys and updates all functions accordingly.
 --
 -- Run this in the Supabase SQL Editor (public schema).
 -- Safe to run on a fresh DB or on top of the original script.
@@ -9,21 +9,25 @@
 
 -- 1. API Keys Configuration Table
 CREATE TABLE IF NOT EXISTS public.api_keys (
-  api_key       TEXT PRIMARY KEY,
-  provider      TEXT        NOT NULL DEFAULT 'default',
-  label         TEXT,
-  reset_day     INT         NOT NULL DEFAULT 1,
-  reset_period  TEXT        NOT NULL DEFAULT 'monthly'
-                            CHECK (reset_period IN ('daily', 'monthly')),
-  max_requests  INT         NOT NULL DEFAULT 200,
-  is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
-  created_at    TIMESTAMPTZ          DEFAULT NOW()
+  api_key              TEXT PRIMARY KEY,
+  provider             TEXT        NOT NULL DEFAULT 'default',
+  label                TEXT,
+  reset_day            INT         NOT NULL DEFAULT 1,
+  reset_period         TEXT        NOT NULL DEFAULT 'monthly'
+                                   CHECK (reset_period IN ('daily', 'monthly')),
+  max_requests         INT         NOT NULL DEFAULT 200,
+  rate_limit_per_minute INT        NOT NULL DEFAULT 20,
+  is_active            BOOLEAN     NOT NULL DEFAULT TRUE,
+  created_at           TIMESTAMPTZ          DEFAULT NOW()
 );
 
--- Add reset_period to existing tables (idempotent)
+-- Idempotent column additions for existing tables
 ALTER TABLE public.api_keys
   ADD COLUMN IF NOT EXISTS reset_period TEXT NOT NULL DEFAULT 'monthly'
   CHECK (reset_period IN ('daily', 'monthly'));
+
+ALTER TABLE public.api_keys
+  ADD COLUMN IF NOT EXISTS rate_limit_per_minute INT NOT NULL DEFAULT 20;
 
 -- 2. API Usage Tracking Table
 CREATE TABLE IF NOT EXISTS public.api_usage (
@@ -125,17 +129,18 @@ $$;
 -- ============================================================
 CREATE OR REPLACE FUNCTION public.get_api_usage(p_api_key TEXT)
 RETURNS TABLE (
-  api_key        TEXT,
-  label          TEXT,
-  provider       TEXT,
-  reset_day      INT,
-  reset_period   TEXT,
-  max_requests   INT,
-  current_count  INT,
-  remaining      INT,
-  period_start   DATE,
-  period_end     DATE,
-  is_active      BOOLEAN
+  api_key               TEXT,
+  label                 TEXT,
+  provider              TEXT,
+  reset_day             INT,
+  reset_period          TEXT,
+  rate_limit_per_minute INT,
+  max_requests          INT,
+  current_count         INT,
+  remaining             INT,
+  period_start          DATE,
+  period_end            DATE,
+  is_active             BOOLEAN
 )
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -163,15 +168,16 @@ BEGIN
     ak.provider,
     ak.reset_day,
     ak.reset_period,
+    ak.rate_limit_per_minute,
     ak.max_requests,
-    COALESCE(au.request_count, 0)                       AS current_count,
-    ak.max_requests - COALESCE(au.request_count, 0)     AS remaining,
-    v_period_start                                       AS period_start,
-    v_period_end                                         AS period_end,
+    COALESCE(au.request_count, 0)                    AS current_count,
+    ak.max_requests - COALESCE(au.request_count, 0)  AS remaining,
+    v_period_start                                    AS period_start,
+    v_period_end                                      AS period_end,
     ak.is_active
   FROM public.api_keys ak
   LEFT JOIN public.api_usage au
-    ON au.api_key     = ak.api_key
+    ON au.api_key      = ak.api_key
    AND au.period_start = v_period_start
   WHERE ak.api_key = p_api_key;
 END;
@@ -180,7 +186,8 @@ $$;
 -- ============================================================
 -- 5. claim_next_available_key
 -- Tries each active key for a provider in order; returns the
--- first one with remaining capacity, or NULL if all exhausted.
+-- first one with remaining daily/monthly capacity, or NULL.
+-- NOTE: per-minute throttling is handled in-process by the proxy.
 -- ============================================================
 CREATE OR REPLACE FUNCTION public.claim_next_available_key(p_provider TEXT)
 RETURNS TEXT
@@ -204,4 +211,25 @@ BEGIN
 
   RETURN NULL;
 END;
+$$;
+
+-- ============================================================
+-- 6. get_active_keys
+-- Returns all active keys for a provider with their per-minute
+-- limit and period config so the proxy can build in-process
+-- per-key rate limiters without additional round-trips.
+-- ============================================================
+CREATE OR REPLACE FUNCTION public.get_active_keys(p_provider TEXT)
+RETURNS TABLE (
+  api_key               TEXT,
+  rate_limit_per_minute INT,
+  reset_period          TEXT,
+  reset_day             INT
+)
+LANGUAGE sql AS $$
+  SELECT api_key, rate_limit_per_minute, reset_period, reset_day
+    FROM public.api_keys
+   WHERE provider  = p_provider
+     AND is_active = TRUE
+   ORDER BY api_key;
 $$;
