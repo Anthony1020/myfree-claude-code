@@ -44,6 +44,11 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("Starting Claude Code Proxy...")
 
+    # Eagerly initialise the key pool so misconfiguration surfaces at startup.
+    from .dependencies import get_key_pool
+
+    get_key_pool()
+
     # Initialize messaging platform if configured
     messaging_platform = None
     message_handler = None

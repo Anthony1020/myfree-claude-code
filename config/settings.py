@@ -121,6 +121,17 @@ class Settings(BaseSettings):
     claude_workspace: str = "./agent_workspace"
     allowed_dir: str = ""
 
+    # ==================== Supabase Key Pool ====================
+    supabase_url: str = Field(default="", validation_alias="SUPABASE_URL")
+    supabase_service_key: str = Field(
+        default="", validation_alias="SUPABASE_SERVICE_KEY"
+    )
+
+    @property
+    def key_pool_enabled(self) -> bool:
+        """True when Supabase credentials are present and key pool is active."""
+        return bool(self.supabase_url and self.supabase_service_key)
+
     # ==================== Server ====================
     host: str = "0.0.0.0"
     port: int = 8082

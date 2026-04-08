@@ -11,6 +11,7 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 from providers.base import BaseProvider, ProviderConfig
+from providers.key_pool import KeyPoolManager
 from providers.common import (
     ContentType,
     HeuristicToolParser,
@@ -55,6 +56,33 @@ class OpenAICompatibleProvider(BaseProvider):
                 write=config.http_write_timeout,
             ),
         )
+        # Key pool — set via set_key_pool() after construction when Supabase is configured.
+        self._key_pool: KeyPoolManager | None = None
+        self._pool_provider: str | None = None
+
+    def set_key_pool(self, key_pool: KeyPoolManager, pool_provider: str) -> None:
+        """Attach a KeyPoolManager so each request claims its own key from the pool."""
+        self._key_pool = key_pool
+        self._pool_provider = pool_provider
+
+    async def _resolve_client(self) -> AsyncOpenAI:
+        """Return the AsyncOpenAI client to use for this request.
+
+        When a key pool is configured, claims the next available key for the
+        provider and returns its cached client. Falls back to the env-var client
+        if the pool is not configured or all pool keys are exhausted.
+        """
+        if self._key_pool is not None and self._pool_provider is not None:
+            pool_client = await self._key_pool.get_client(
+                self._pool_provider, self._base_url, self._config
+            )
+            if pool_client is not None:
+                return pool_client
+            logger.warning(
+                "KeyPool: all {} keys exhausted, falling back to env-var key",
+                self._pool_provider,
+            )
+        return self._client
 
     async def cleanup(self) -> None:
         """Release HTTP client resources."""
@@ -157,10 +185,11 @@ class OpenAICompatibleProvider(BaseProvider):
         error_occurred = False
         error_message = ""
 
+        active_client = await self._resolve_client()
         async with self._global_rate_limiter.concurrency_slot():
             try:
                 stream = await self._global_rate_limiter.execute_with_retry(
-                    self._client.chat.completions.create, **body, stream=True
+                    active_client.chat.completions.create, **body, stream=True
                 )
                 async for chunk in stream:
                     if getattr(chunk, "usage", None):

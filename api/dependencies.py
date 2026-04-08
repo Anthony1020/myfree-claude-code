@@ -8,13 +8,32 @@ from config.settings import get_settings as _get_settings
 from providers.base import BaseProvider, ProviderConfig
 from providers.common import get_user_facing_error_message
 from providers.exceptions import AuthenticationError
+from providers.key_pool import KeyPoolManager
 from providers.llamacpp import LlamaCppProvider
 from providers.lmstudio import LMStudioProvider
 from providers.nvidia_nim import NVIDIA_NIM_BASE_URL, NvidiaNimProvider
 from providers.open_router import OPENROUTER_BASE_URL, OpenRouterProvider
+from providers.openai_compat import OpenAICompatibleProvider
 
 # Provider registry: keyed by provider type string, lazily populated
 _providers: dict[str, BaseProvider] = {}
+
+# Key pool singleton — None when Supabase is not configured
+_key_pool: KeyPoolManager | None = None
+
+# Provider types that support key-pool rotation (cloud providers only)
+_POOL_SUPPORTED = frozenset({"nvidia_nim", "open_router"})
+
+
+def get_key_pool() -> KeyPoolManager | None:
+    """Return the KeyPoolManager singleton, initialising it on first call if configured."""
+    global _key_pool
+    if _key_pool is None:
+        settings = _get_settings()
+        if settings.key_pool_enabled:
+            _key_pool = KeyPoolManager(settings.supabase_url, settings.supabase_service_key)
+            logger.info("KeyPool initialised (Supabase URL: {})", settings.supabase_url)
+    return _key_pool
 
 
 def get_settings() -> Settings:
@@ -96,12 +115,23 @@ def get_provider_for_type(provider_type: str) -> BaseProvider:
     """Get or create a provider for the given provider type.
 
     Providers are cached in the registry and reused across requests.
+    When a KeyPoolManager is configured, cloud providers have it attached so
+    each request claims its own key from the Supabase pool.
     """
     if provider_type not in _providers:
         try:
-            _providers[provider_type] = _create_provider_for_type(
-                provider_type, get_settings()
-            )
+            provider = _create_provider_for_type(provider_type, get_settings())
+            # Attach key pool for supported cloud providers when Supabase is configured.
+            if provider_type in _POOL_SUPPORTED and isinstance(
+                provider, OpenAICompatibleProvider
+            ):
+                pool = get_key_pool()
+                if pool is not None:
+                    provider.set_key_pool(pool, provider_type)
+                    logger.info(
+                        "KeyPool attached to provider: {}", provider_type
+                    )
+            _providers[provider_type] = provider
         except AuthenticationError as e:
             raise HTTPException(
                 status_code=503, detail=get_user_facing_error_message(e)
@@ -153,9 +183,12 @@ def get_provider() -> BaseProvider:
 
 
 async def cleanup_provider():
-    """Cleanup all provider resources."""
-    global _providers
+    """Cleanup all provider and key pool resources."""
+    global _providers, _key_pool
     for provider in _providers.values():
         await provider.cleanup()
     _providers = {}
+    if _key_pool is not None:
+        await _key_pool.cleanup()
+        _key_pool = None
     logger.debug("Provider cleanup completed")
